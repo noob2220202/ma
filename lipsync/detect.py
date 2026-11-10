@@ -10,8 +10,14 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from . import LipsyncError
+
 _CHANNEL_MEANS = np.array([104, 117, 123], dtype=np.float32)
-_MAX_SIDE = 1280
+_MAX_SIDE = 1920
+# S3FD's largest anchor is 512 px: as a face approaches that size its box shrinks towards the nose, so a
+# close-up is detected again at a scale where the face is comfortably inside the anchor range.
+_MAX_FACE = 400
+_REDETECT_FACE = 256
 _CANDIDATE_SCORE = 0.05
 _FACE_SCORE = 0.5
 _NMS_OVERLAP = 0.3
@@ -27,7 +33,7 @@ _BACKBONE = [
 _HEADS = [("conv3_3_norm", 256), ("conv4_3_norm", 512), ("conv5_3_norm", 512), ("fc7", 1024), ("conv6_2", 512), ("conv7_2", 256)]
 
 
-class FaceNotFound(ValueError):
+class FaceNotFound(LipsyncError):
     pass
 
 
@@ -105,11 +111,8 @@ def nms(boxes: np.ndarray, overlap: float) -> list[int]:
 
 
 @torch.inference_mode()
-def detect_face(image_bgr: np.ndarray, model: S3FD, device: str) -> tuple[int, int, int, int]:
-    """Box (x1, y1, x2, y2) of the largest confidently detected face."""
-    scale = min(1.0, _MAX_SIDE / max(image_bgr.shape[:2]))
-    if scale < 1:
-        image_bgr = cv2.resize(image_bgr, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+def _faces(image_bgr: np.ndarray, model: S3FD, device: str) -> np.ndarray:
+    """(N, 5) confident detections [x1, y1, x2, y2, score] in the pixels of the given image."""
     # The Wav2Lip training crops came from this detector fed RGB-ordered pixels, so the boxes it was
     # trained on are reproduced by doing the same rather than the BGR the Caffe means imply.
     pixels = image_bgr[..., ::-1].astype(np.float32) - _CHANNEL_MEANS
@@ -128,9 +131,20 @@ def detect_face(image_bgr: np.ndarray, model: S3FD, device: str) -> tuple[int, i
     candidates = torch.cat(candidates).cpu().numpy()
 
     faces = candidates[nms(candidates, _NMS_OVERLAP)]
-    faces = faces[faces[:, 4] > _FACE_SCORE]
-    if len(faces) == 0:
-        raise FaceNotFound("no face detected in the image")
-    largest = faces[np.argmax((faces[:, 2] - faces[:, 0]) * (faces[:, 3] - faces[:, 1]))]
-    x1, y1, x2, y2 = (np.clip(largest[:4], 0, None) / scale).astype(int)
-    return int(x1), int(y1), int(x2), int(y2)
+    return faces[faces[:, 4] > _FACE_SCORE]
+
+
+def detect_face(image_bgr: np.ndarray, model: S3FD, device: str) -> tuple[int, int, int, int]:
+    """Box (x1, y1, x2, y2) of the largest confidently detected face."""
+    scale = min(1.0, _MAX_SIDE / max(image_bgr.shape[:2]))
+    while True:
+        resized = image_bgr if scale == 1 else cv2.resize(image_bgr, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+        faces = _faces(resized, model, device)
+        if len(faces) == 0:
+            raise FaceNotFound("no face detected in the image")
+        largest = faces[np.argmax((faces[:, 2] - faces[:, 0]) * (faces[:, 3] - faces[:, 1]))]
+        side = max(largest[2] - largest[0], largest[3] - largest[1])
+        if side <= _MAX_FACE:
+            x1, y1, x2, y2 = (np.clip(largest[:4], 0, None) / scale).astype(int)
+            return int(x1), int(y1), int(x2), int(y2)
+        scale *= _REDETECT_FACE / side

@@ -12,7 +12,7 @@ import cv2
 import numpy as np
 import torch
 
-from . import audio, weights
+from . import LipsyncError, audio, weights
 from .pipeline import RenderInfo, load_image
 from .wav2lip import FACE_SIZE, SYNC_FRAMES, SyncNet, load_sync_expert
 
@@ -21,7 +21,9 @@ _BACKGROUND_SAMPLE_EVERY = 25
 _AUDIO_DURATION_TOLERANCE_S = 0.1
 _EXPERT_FPS = 25.0
 _SYNC_SHIFTS = 6
-_MIN_SYNC_CONFIDENCE = 0.1
+# One-second stretches of an in-sync render peak 0.4 or more above the median; near-silent clips, whose
+# best offset is noise, stay under 0.2.
+_MIN_SYNC_CONFIDENCE = 0.3
 
 
 @dataclass(frozen=True)
@@ -32,11 +34,18 @@ class Check:
 
 
 def _probe(path: Path) -> dict:
-    command = ["ffprobe", "-v", "error", "-show_format", "-show_streams", "-of", "json", str(path)]
+    command = ["ffprobe", "-v", "error", "-show_format", "-show_streams", "-of", "json", "-i", str(path)]
     result = subprocess.run(command, capture_output=True, text=True)
     if result.returncode != 0:
-        raise ValueError(f"cannot probe {path}: {result.stderr.strip()}")
+        raise LipsyncError(f"cannot probe {path}: {result.stderr.strip()}")
     return json.loads(result.stdout)
+
+
+def _render_info(probe: dict, path: Path) -> RenderInfo:
+    try:
+        return RenderInfo(**json.loads(probe["format"]["tags"]["comment"]))
+    except (KeyError, TypeError, ValueError):
+        raise LipsyncError(f"{path} carries no render metadata; was it produced by lipsync render?") from None
 
 
 def _decoded_frames(path: Path, width: int, height: int) -> Iterator[np.ndarray]:
@@ -76,7 +85,8 @@ def _sync_check(lower_faces: np.ndarray, wav: np.ndarray, fps: float, expert: Sy
     similarity = {shift: float((faces * sounds[shift + _SYNC_SHIFTS :][:windows]).sum(dim=1).mean()) for shift in shifts}
     best = max(similarity, key=similarity.get)
     confidence = similarity[best] - float(np.median(list(similarity.values())))
-    timing = "in sync" if best == 0 else f"lips {abs(best)} frames {'ahead of' if best > 0 else 'behind'} the audio"
+    frames_off = f"{abs(best)} frame{'s' if abs(best) > 1 else ''}"
+    timing = "in sync" if best == 0 else f"lips {frames_off} {'ahead of' if best > 0 else 'behind'} the audio"
     detail = f"{timing}; similarity {similarity[best]:.2f}, {confidence:.2f} above the median over ±{_SYNC_SHIFTS} frames"
     if confidence < _MIN_SYNC_CONFIDENCE:
         return Check(name, None, f"no clear best offset ({detail})")
@@ -89,14 +99,11 @@ def verify(
     """Checks of the render at `video_path` against the portrait and recording it was made from."""
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     probe = _probe(video_path)
-    comment = probe["format"].get("tags", {}).get("comment")
-    if comment is None:
-        raise ValueError(f"{video_path} carries no render metadata; was it produced by lipsync render?")
-    info = RenderInfo(**json.loads(comment))
+    info = _render_info(probe, video_path)
     streams = {stream["codec_type"]: stream for stream in reversed(probe["streams"])}
     video, sound = streams.get("video"), streams.get("audio")
     if video is None:
-        raise ValueError(f"{video_path} has no video stream")
+        raise LipsyncError(f"{video_path} has no video stream")
 
     image = load_image(face_path)
     height, width = image.shape[:2]

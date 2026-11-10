@@ -9,6 +9,8 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from . import LipsyncError
+
 SAMPLE_RATE = 16000
 N_FFT = 800
 HOP_LENGTH = 200
@@ -28,14 +30,17 @@ _MEL_LOG_STEP = math.log(6.4) / 27
 
 
 def decode(path: Path) -> np.ndarray:
-    """Any ffmpeg-readable audio as mono float32 samples at SAMPLE_RATE."""
-    command = ["ffmpeg", "-v", "error", "-nostdin", "-i", str(path), "-vn", "-ac", "1", "-ar", str(SAMPLE_RATE), "-f", "f32le", "-"]
+    """Any ffmpeg-readable audio as mono float32 samples at SAMPLE_RATE, with sample 0 at the file's time zero."""
+    # Raw output drops timestamps, so a track that starts after its file does (as a player would present
+    # it, and as muxing it preserves) is padded with that much silence first.
+    on_timeline = "aresample=async=1:first_pts=0"
+    command = ["ffmpeg", "-v", "error", "-nostdin", "-i", str(path), "-vn", "-af", on_timeline, "-ac", "1", "-ar", str(SAMPLE_RATE), "-f", "f32le", "-"]
     result = subprocess.run(command, capture_output=True)
     if result.returncode != 0:
-        raise ValueError(f"cannot decode audio {path}: {result.stderr.decode(errors='replace').strip()}")
+        raise LipsyncError(f"cannot decode audio {path}: {result.stderr.decode(errors='replace').strip()}")
     wav = np.frombuffer(result.stdout, dtype=np.float32)
     if wav.size == 0:
-        raise ValueError(f"{path} contains no audio")
+        raise LipsyncError(f"{path} contains no audio")
     return wav
 
 

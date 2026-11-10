@@ -1,9 +1,12 @@
 import subprocess
 
 import numpy as np
+import pytest
 
+from lipsync import LipsyncError
+from lipsync.cli import main
 from lipsync.pipeline import RenderInfo, _VideoWriter, box_mask, motion_mask
-from lipsync.verify import _decoded_frames, _probe
+from lipsync.verify import _decoded_frames, _probe, verify
 
 
 def test_box_mask_leaves_box_edges_and_upper_face_original():
@@ -52,6 +55,18 @@ def test_writer_muxes_audio_and_preserves_colour(tmp_path):
     decoded = list(_decoded_frames(out, info.width, info.height))
     assert len(decoded) == info.frames
     assert np.abs(decoded[0].astype(int) - frame).mean() < 3
+
+
+def test_cli_refuses_a_non_mp4_output_before_doing_any_work(tmp_path, capsys):
+    assert main(["render", "face.png", "speech.wav", "-o", str(tmp_path / "out.mkv")]) == 1
+    assert "must be an .mp4 file" in capsys.readouterr().err
+
+
+def test_verify_rejects_a_video_it_did_not_render(tmp_path):
+    foreign = tmp_path / "foreign.mp4"
+    subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc=d=0.2:s=64x48", "-metadata", "comment=hello", str(foreign)], check=True)
+    with pytest.raises(LipsyncError, match="no render metadata"):
+        verify(foreign, tmp_path / "face.png", tmp_path / "speech.wav")
 
 
 def test_writer_leaves_no_file_when_rendering_fails(tmp_path):

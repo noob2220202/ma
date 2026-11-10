@@ -10,6 +10,8 @@ import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
+from . import LipsyncError
+
 log = logging.getLogger(__name__)
 
 DEFAULT_DIR = Path(os.environ.get("LIPSYNC_MODELS", "models"))
@@ -53,7 +55,7 @@ def _download(url: str, path: Path) -> None:
     log.info("downloading %s", url)
     path.parent.mkdir(parents=True, exist_ok=True)
     partial = path.with_name(path.name + ".part")
-    with urllib.request.urlopen(url) as response, open(partial, "wb") as file:
+    with urllib.request.urlopen(url, timeout=60) as response, open(partial, "wb") as file:
         shutil.copyfileobj(response, file, 1 << 20)
     partial.replace(path)
 
@@ -69,5 +71,5 @@ def ensure(name: str, models_dir: Path = DEFAULT_DIR) -> Path:
     if digest != weight.sha256:
         if fresh:
             path.unlink()
-        raise RuntimeError(f"{path} has SHA-256 {digest}, expected {weight.sha256}")
+        raise LipsyncError(f"{path} has SHA-256 {digest}, expected {weight.sha256}; delete it to download a fresh copy")
     return path

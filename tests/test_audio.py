@@ -1,3 +1,5 @@
+import subprocess
+
 import numpy as np
 import pytest
 
@@ -9,6 +11,17 @@ def _speechlike(seconds: float) -> np.ndarray:
     t = np.arange(int(seconds * audio.SAMPLE_RATE)) / audio.SAMPLE_RATE
     voiced = 0.3 * np.sin(2 * np.pi * 180 * t) * (1 + np.sin(2 * np.pi * 3 * t))
     return (voiced + 0.05 * rng.standard_normal(t.size)).astype(np.float32)
+
+
+def test_decode_keeps_a_late_starting_track_on_the_file_timeline(tmp_path):
+    clip = tmp_path / "late_audio.mp4"
+    command = ["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc=d=1:s=64x48:r=25",
+               "-itsoffset", "0.5", "-f", "lavfi", "-i", "sine=frequency=440:duration=0.5", str(clip)]
+    subprocess.run(command, check=True)
+    wav = audio.decode(clip)
+    assert abs(len(wav) / audio.SAMPLE_RATE - 1.0) < 0.1
+    assert np.abs(wav[: int(0.4 * audio.SAMPLE_RATE)]).max() < 1e-3
+    assert np.abs(wav[int(0.6 * audio.SAMPLE_RATE) : int(0.9 * audio.SAMPLE_RATE)]).max() > 0.05
 
 
 def test_filterbank_matches_librosa():

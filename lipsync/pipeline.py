@@ -13,7 +13,7 @@ import cv2
 import numpy as np
 import torch
 
-from . import audio, weights
+from . import LipsyncError, audio, weights
 from .detect import detect_face, load_detector
 from .wav2lip import FACE_SIZE, face_input, load_generator
 
@@ -38,7 +38,7 @@ def load_image(path: Path) -> np.ndarray:
     """The portrait as BGR pixels, cropped by at most one row and column to the even size yuv420p needs."""
     image = cv2.imread(str(path), cv2.IMREAD_COLOR)
     if image is None:
-        raise ValueError(f"cannot read image {path}")
+        raise LipsyncError(f"cannot read image {path}")
     return image[: image.shape[0] // 2 * 2, : image.shape[1] // 2 * 2]
 
 
@@ -80,7 +80,7 @@ class _VideoWriter:
     """Pipes BGR frames to ffmpeg, muxing them with the audio; the file only appears at `path` on success."""
 
     def __init__(self, path: Path, info: RenderInfo, audio_path: Path):
-        self._path = Path(path)
+        self._path = Path(path).resolve()  # absolute, so ffmpeg cannot read a leading dash as an option
         self._partial = self._path.with_name(f"{self._path.stem}.partial{self._path.suffix}")
         self._path.parent.mkdir(parents=True, exist_ok=True)
         self._stderr = tempfile.TemporaryFile()
@@ -105,7 +105,7 @@ class _VideoWriter:
         try:
             self._process.stdin.write(frame.tobytes())
         except BrokenPipeError:
-            raise RuntimeError(f"ffmpeg stopped while encoding {self._path}: {self._close()[1]}") from None
+            raise LipsyncError(f"ffmpeg stopped while encoding {self._path}: {self._close()[1]}") from None
 
     def _close(self) -> tuple[int, str]:
         """Wait for ffmpeg to exit; returns its exit code and error output."""
@@ -132,7 +132,7 @@ class _VideoWriter:
         code, errors = self._close()
         if code != 0:
             self._partial.unlink(missing_ok=True)
-            raise RuntimeError(f"ffmpeg failed while encoding {self._path}: {errors}")
+            raise LipsyncError(f"ffmpeg failed while encoding {self._path}: {errors}")
         self._partial.replace(self._path)
 
 
@@ -152,6 +152,8 @@ def render(
     `pads` grows the detected face box by (top, bottom, left, right) pixels; the bottom padding keeps
     the chin inside the region the generator redraws.
     """
+    if Path(out_path).suffix.lower() != ".mp4":
+        raise LipsyncError(f"output must be an .mp4 file, not {out_path}")
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     image = load_image(face_path)
     height, width = image.shape[:2]
