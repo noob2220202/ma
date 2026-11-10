@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lipsync"
+version = "0.1.0"
+description = "Still-image lip-sync: animate the mouth of one portrait to match a speech recording"
+requires-python = ">=3.10"
+dependencies = ["numpy", "opencv-python-headless", "torch"]
+
+[project.optional-dependencies]
+dev = ["pytest", "librosa"]
+
+[project.scripts]
+lipsync = "lipsync.cli:main"
+
+[tool.setuptools]
+packages = ["lipsync"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
