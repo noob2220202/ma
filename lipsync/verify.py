@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import subprocess
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -16,7 +17,8 @@ from . import LipsyncError, audio, weights
 from .pipeline import RenderInfo, load_image
 from .wav2lip import FACE_SIZE, SYNC_FRAMES, SyncNet, load_sync_expert
 
-_BACKGROUND_PSNR_DB = 35.0
+_BACKGROUND_BLOCK = 16
+_BACKGROUND_MAX_DIFFERENCE = 10.0  # grey levels between block means
 _BACKGROUND_SAMPLE_EVERY = 25
 _AUDIO_DURATION_TOLERANCE_S = 0.1
 _EXPERT_FPS = 25.0
@@ -34,7 +36,7 @@ class Check:
 
 
 def _probe(path: Path) -> dict:
-    command = ["ffprobe", "-v", "error", "-show_format", "-show_streams", "-of", "json", "-i", str(path)]
+    command = ["ffprobe", "-v", "error", "-show_format", "-show_streams", "-of", "json", "-i", audio.ffmpeg_path(path)]
     result = subprocess.run(command, capture_output=True, text=True)
     if result.returncode != 0:
         raise LipsyncError(f"cannot probe {path}: {result.stderr.strip()}")
@@ -43,17 +45,28 @@ def _probe(path: Path) -> dict:
 
 def _render_info(probe: dict, path: Path) -> RenderInfo:
     try:
-        return RenderInfo(**json.loads(probe["format"]["tags"]["comment"]))
+        fields = json.loads(probe["format"]["tags"]["comment"])
+        box = tuple(int(value) for value in fields["box"])
+        info = RenderInfo(box, float(fields["fps"]), int(fields["frames"]), int(fields["width"]), int(fields["height"]))
+        x1, y1, x2, y2 = box
+        if not (0 <= x1 < x2 <= info.width and 0 <= y1 < y2 <= info.height and 0 < info.fps < math.inf):
+            raise ValueError
     except (KeyError, TypeError, ValueError):
-        raise LipsyncError(f"{path} carries no render metadata; was it produced by lipsync render?") from None
+        raise LipsyncError(f"{path} carries no usable render metadata; was it produced by lipsync render?") from None
+    return info
 
 
 def _decoded_frames(path: Path, width: int, height: int) -> Iterator[np.ndarray]:
-    command = ["ffmpeg", "-v", "error", "-nostdin", "-i", str(path), "-map", "0:v:0", "-f", "rawvideo", "-pix_fmt", "bgr24", "-"]
+    command = ["ffmpeg", "-v", "error", "-nostdin", "-i", audio.ffmpeg_path(path), "-map", "0:v:0", "-f", "rawvideo", "-pix_fmt", "bgr24", "-"]
     with subprocess.Popen(command, stdout=subprocess.PIPE) as process:
         size = width * height * 3
         while len(buffer := process.stdout.read(size)) == size:
             yield np.frombuffer(buffer, dtype=np.uint8).reshape(height, width, 3)
+
+
+def _block_means(image: np.ndarray) -> np.ndarray:
+    scale = 1 / _BACKGROUND_BLOCK
+    return cv2.resize(image, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA).astype(np.float32)
 
 
 def _embed(encode, inputs: torch.Tensor, batch_size: int = 128) -> torch.Tensor:
@@ -108,42 +121,48 @@ def verify(
     image = load_image(face_path)
     height, width = image.shape[:2]
     recording = audio.decode(audio_path)
-    seconds = len(recording) / audio.SAMPLE_RATE
     checks = []
 
     described = f"{video['codec_name']} {video['pix_fmt']} {video['width']}x{video['height']} at {video['r_frame_rate']} fps"
     expected = (video["codec_name"], video["pix_fmt"], video["width"], video["height"]) == ("h264", "yuv420p", width, height)
     checks.append(Check("video stream", expected, described))
 
-    if sound is None:
+    # The muxed track is judged as decoded, which is what a player presents.
+    muxed = audio.decode(video_path) if sound is not None else None
+    if muxed is None:
         checks.append(Check("audio stream", False, "missing"))
     else:
-        duration = float(sound["duration"])
-        close = abs(duration - seconds) <= _AUDIO_DURATION_TOLERANCE_S
-        checks.append(Check("audio stream", close, f"{sound['codec_name']} {duration:.2f} s (recording is {seconds:.2f} s)"))
+        seconds, wanted_seconds = len(muxed) / audio.SAMPLE_RATE, len(recording) / audio.SAMPLE_RATE
+        close = abs(seconds - wanted_seconds) <= _AUDIO_DURATION_TOLERANCE_S
+        checks.append(Check("audio stream", close, f"{sound['codec_name']} {seconds:.2f} s (recording is {wanted_seconds:.2f} s)"))
     if not expected:
         return checks
 
+    # Block means rather than pixels: encoder noise on a grainy portrait averages out, while a misplaced
+    # paste or a colour error moves whole blocks.
     x1, y1, x2, y2 = info.box
-    outside = np.ones((height, width, 1), dtype=bool)
-    outside[y1:y2, x1:x2] = False
-    reference = image.astype(np.float32)
+    in_box = np.zeros((height, width), dtype=np.float32)
+    in_box[y1:y2, x1:x2] = 1
+    outside = _block_means(in_box) == 0
+    reference = _block_means(image)
 
-    lower_faces, worst_psnr = [], np.inf
+    lower_faces, worst_difference = [], 0.0
     for index, frame in enumerate(_decoded_frames(video_path, width, height)):
         lower_faces.append(cv2.resize(frame[y1:y2, x1:x2], (FACE_SIZE, FACE_SIZE))[FACE_SIZE // 2 :])
-        if index % _BACKGROUND_SAMPLE_EVERY == 0:
-            error = np.square(frame - reference, where=outside, out=np.zeros_like(reference)).sum() / (outside.sum() * 3)
-            worst_psnr = min(worst_psnr, 10 * np.log10(255**2 / max(error, 1e-12)))
+        if index % _BACKGROUND_SAMPLE_EVERY == 0 and outside.any():
+            worst_difference = max(worst_difference, float(np.abs(_block_means(frame) - reference)[outside].max()))
 
     wanted = audio.frame_count(recording, info.fps)
     count = len(lower_faces)
     checks.append(Check("frame count", count == wanted == info.frames, f"{count} decoded, {wanted} needed to cover the recording"))
     if count == 0:
         return checks
-    checks.append(Check("background fidelity", worst_psnr >= _BACKGROUND_PSNR_DB, f"worst PSNR outside the face box {worst_psnr:.1f} dB"))
-    if sound is not None:
-        # Timing is judged against the muxed track, which is what a player presents.
+    if outside.any():
+        detail = f"largest change outside the face box {worst_difference:.1f} of 255 (means of {_BACKGROUND_BLOCK}x{_BACKGROUND_BLOCK} blocks)"
+        checks.append(Check("background fidelity", worst_difference <= _BACKGROUND_MAX_DIFFERENCE, detail))
+    else:
+        checks.append(Check("background fidelity", None, "the face box fills the image"))
+    if muxed is not None:
         expert = load_sync_expert(weights.ensure("sync_expert", models_dir), device)
-        checks.append(_sync_check(np.array(lower_faces), audio.decode(video_path), info.fps, expert, device))
+        checks.append(_sync_check(np.array(lower_faces), audio.at_speech_level(muxed), info.fps, expert, device))
     return checks

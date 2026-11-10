@@ -65,7 +65,7 @@ def test_cli_refuses_a_non_mp4_output_before_doing_any_work(tmp_path, capsys):
 def test_verify_rejects_a_video_it_did_not_render(tmp_path):
     foreign = tmp_path / "foreign.mp4"
     subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc=d=0.2:s=64x48", "-metadata", "comment=hello", str(foreign)], check=True)
-    with pytest.raises(LipsyncError, match="no render metadata"):
+    with pytest.raises(LipsyncError, match="render metadata"):
         verify(foreign, tmp_path / "face.png", tmp_path / "speech.wav")
 
 

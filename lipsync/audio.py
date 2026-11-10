@@ -23,10 +23,17 @@ MAX_ABS_VALUE = 4.0
 MEL_WINDOW = 16
 MEL_FRAMES_PER_SECOND = SAMPLE_RATE / HOP_LENGTH
 WINDOW_SECONDS = MEL_WINDOW / MEL_FRAMES_PER_SECOND
+SPEECH_LEVEL = 0.07  # RMS, about -23 dBFS: the middle of the range where sync quality is flat
+_MAX_LEVEL_GAIN = 10.0  # 20 dB, so room tone is not amplified into speech
 
 _MEL_BREAK_HZ = 1000.0
 _MEL_LINEAR_HZ = 200.0 / 3
 _MEL_LOG_STEP = math.log(6.4) / 27
+
+
+def ffmpeg_path(path: Path) -> str:
+    """The path as ffmpeg must be given it, so that a colon or a leading dash in a file name is not read as syntax."""
+    return f"file:{path}"
 
 
 def decode(path: Path) -> np.ndarray:
@@ -34,7 +41,7 @@ def decode(path: Path) -> np.ndarray:
     # Raw output drops timestamps, so a track that starts after its file does (as a player would present
     # it, and as muxing it preserves) is padded with that much silence first.
     on_timeline = "aresample=async=1:first_pts=0"
-    command = ["ffmpeg", "-v", "error", "-nostdin", "-i", str(path), "-vn", "-af", on_timeline, "-ac", "1", "-ar", str(SAMPLE_RATE), "-f", "f32le", "-"]
+    command = ["ffmpeg", "-v", "error", "-nostdin", "-i", ffmpeg_path(path), "-vn", "-af", on_timeline, "-ac", "1", "-ar", str(SAMPLE_RATE), "-f", "f32le", "-"]
     result = subprocess.run(command, capture_output=True)
     if result.returncode != 0:
         raise LipsyncError(f"cannot decode audio {path}: {result.stderr.decode(errors='replace').strip()}")
@@ -42,6 +49,19 @@ def decode(path: Path) -> np.ndarray:
     if wav.size == 0:
         raise LipsyncError(f"{path} contains no audio")
     return wav
+
+
+def at_speech_level(wav: np.ndarray) -> np.ndarray:
+    """`wav` scaled so that its loud stretches sit at SPEECH_LEVEL.
+
+    The models read absolute level: for a recording 20 dB quieter than the speech they were trained on
+    the generated mouth moves a quarter less, and at 30 dB about half.
+    """
+    windows = wav[: len(wav) // N_FFT * N_FFT].reshape(-1, N_FFT)
+    loud = np.quantile(np.sqrt(np.square(windows).mean(axis=1)), 0.95) if len(windows) else 0.0
+    if loud == 0:
+        return wav
+    return wav * np.float32(np.clip(SPEECH_LEVEL / loud, 1 / _MAX_LEVEL_GAIN, _MAX_LEVEL_GAIN))
 
 
 def _hz_to_mel(hz: np.ndarray) -> np.ndarray:

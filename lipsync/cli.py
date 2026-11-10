@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import math
 import sys
 from pathlib import Path
 
@@ -11,8 +12,8 @@ from . import LipsyncError, weights
 def _positive(convert):
     def parse(text: str):
         value = convert(text)
-        if value <= 0:
-            raise argparse.ArgumentTypeError(f"must be positive, not {text}")
+        if not 0 < value < math.inf:
+            raise argparse.ArgumentTypeError(f"must be a positive number, not {text}")
         return value
 
     return parse

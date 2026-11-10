@@ -80,7 +80,7 @@ class _VideoWriter:
     """Pipes BGR frames to ffmpeg, muxing them with the audio; the file only appears at `path` on success."""
 
     def __init__(self, path: Path, info: RenderInfo, audio_path: Path):
-        self._path = Path(path).resolve()  # absolute, so ffmpeg cannot read a leading dash as an option
+        self._path = Path(path)
         self._partial = self._path.with_name(f"{self._path.stem}.partial{self._path.suffix}")
         self._path.parent.mkdir(parents=True, exist_ok=True)
         self._stderr = tempfile.TemporaryFile()
@@ -88,7 +88,7 @@ class _VideoWriter:
             "ffmpeg", "-y", "-v", "error",
             "-f", "rawvideo", "-pix_fmt", "bgr24", "-video_size", f"{info.width}x{info.height}",
             "-framerate", str(info.fps), "-i", "pipe:0",
-            "-i", str(audio_path),
+            "-i", audio.ffmpeg_path(audio_path),
             "-map", "0:v:0", "-map", "1:a:0",
             # Without an explicit matrix ffmpeg converts RGB with BT.601 while players assume BT.709 for HD.
             "-vf", "scale=out_color_matrix=bt709:out_range=tv,format=yuv420p",
@@ -97,7 +97,7 @@ class _VideoWriter:
             "-c:a", "aac", "-b:a", "192k",
             "-metadata", f"comment={json.dumps(asdict(info))}",
             "-movflags", "+faststart",
-            str(self._partial),
+            audio.ffmpeg_path(self._partial),
         ]
         self._process = subprocess.Popen(command, stdin=subprocess.PIPE, stderr=self._stderr)
 
@@ -130,10 +130,13 @@ class _VideoWriter:
             self._partial.unlink(missing_ok=True)
             return
         code, errors = self._close()
-        if code != 0:
+        try:
+            if code != 0:
+                raise LipsyncError(f"ffmpeg failed while encoding {self._path}: {errors}")
+            self._partial.replace(self._path)
+        except BaseException:
             self._partial.unlink(missing_ok=True)
-            raise LipsyncError(f"ffmpeg failed while encoding {self._path}: {errors}")
-        self._partial.replace(self._path)
+            raise
 
 
 def render(
@@ -159,7 +162,7 @@ def render(
     height, width = image.shape[:2]
 
     wav = audio.decode(audio_path)
-    mels = torch.from_numpy(audio.frame_windows(wav, fps)).unsqueeze(1)
+    mels = torch.from_numpy(audio.frame_windows(audio.at_speech_level(wav), fps)).unsqueeze(1)
 
     detector = load_detector(weights.ensure("s3fd", models_dir), device)
     x1, y1, x2, y2 = detect_face(image, detector, device)

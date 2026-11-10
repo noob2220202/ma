@@ -24,6 +24,21 @@ def test_decode_keeps_a_late_starting_track_on_the_file_timeline(tmp_path):
     assert np.abs(wav[int(0.6 * audio.SAMPLE_RATE) : int(0.9 * audio.SAMPLE_RATE)]).max() > 0.05
 
 
+def test_speech_level_does_not_depend_on_recording_gain():
+    wav = _speechlike(2.0)
+    levelled = audio.at_speech_level(wav)
+    np.testing.assert_allclose(audio.at_speech_level(0.05 * wav), levelled, rtol=1e-4)
+    loud_windows = np.sqrt(np.square(levelled[: len(levelled) // 800 * 800].reshape(-1, 800)).mean(axis=1))
+    assert abs(np.quantile(loud_windows, 0.95) - audio.SPEECH_LEVEL) < 1e-3
+
+
+def test_speech_level_leaves_silence_alone_and_caps_its_gain():
+    silence = np.zeros(16000, dtype=np.float32)
+    assert (audio.at_speech_level(silence) == 0).all()
+    room_tone = 1e-4 * _speechlike(1.0)
+    np.testing.assert_allclose(audio.at_speech_level(room_tone), 10 * room_tone, rtol=1e-5)
+
+
 def test_filterbank_matches_librosa():
     librosa = pytest.importorskip("librosa")
     expected = librosa.filters.mel(sr=16000, n_fft=800, n_mels=80, fmin=55, fmax=7600)

@@ -14,6 +14,7 @@ from . import LipsyncError
 
 _CHANNEL_MEANS = np.array([104, 117, 123], dtype=np.float32)
 _MAX_SIDE = 1920
+_MIN_SIDE = 32  # the network halves its input five times
 # S3FD's largest anchor is 512 px: as a face approaches that size its box shrinks towards the nose, so a
 # close-up is detected again at a scale where the face is comfortably inside the anchor range.
 _MAX_FACE = 400
@@ -139,7 +140,7 @@ def detect_face(image_bgr: np.ndarray, model: S3FD, device: str) -> tuple[int, i
     scale = min(1.0, _MAX_SIDE / max(image_bgr.shape[:2]))
     while True:
         resized = image_bgr if scale == 1 else cv2.resize(image_bgr, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
-        faces = _faces(resized, model, device)
+        faces = _faces(resized, model, device) if min(resized.shape[:2]) >= _MIN_SIDE else []
         if len(faces) == 0:
             raise FaceNotFound("no face detected in the image")
         largest = faces[np.argmax((faces[:, 2] - faces[:, 0]) * (faces[:, 3] - faces[:, 1]))]
